@@ -1,0 +1,55 @@
+{
+  "name": "homebridge-aidot",
+  "displayName": "Homebridge AiDot",
+  "version": "1.0.0",
+  "description": "Homebridge plugin for AiDot WiFi smart lights with on/off, brightness, RGBW, and CCT control",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "clean": "rimraf ./dist",
+    "build": "rimraf ./dist && tsc",
+    "prepublishOnly": "npm run build",
+    "watch": "npm run build && nodemon --watch src --ext ts --exec npm run build"
+  },
+  "engines": {
+    "node": "^18.20.4 || ^20.15.1 || ^22",
+    "homebridge": "^1.6.0 || ^2.0.0-beta.0"
+  },
+  "keywords": [
+    "homebridge-plugin",
+    "homebridge",
+    "aidot",
+    "smart-light",
+    "lightbulb",
+    "rgbw",
+    "color-temperature",
+    "wifi-light"
+  ],
+  "author": "harshal",
+  "license": "MIT",
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist",
+    "config.schema.json"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/harshal/homebridge-aidot.git"
+  },
+  "dependencies": {
+    "aes-js": "3.1.2"
+  },
+  "peerDependencies": {
+    "homebridge": ">=1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "homebridge": "^1.8.0",
+    "typescript": "^5.0.0",
+    "rimraf": "^5.0.0"
+  }
+}

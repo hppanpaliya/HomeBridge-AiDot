@@ -1,0 +1,48 @@
+{
+  "pluginAlias": "AiDot",
+  "pluginType": "platform",
+  "singular": true,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "type": "string",
+        "required": true,
+        "default": "AiDot Lights"
+      },
+      "username": {
+        "title": "AiDot Account Username",
+        "type": "string",
+        "required": true,
+        "description": "Your AiDot app username (email or phone number). Required for cloud device discovery."
+      },
+      "password": {
+        "title": "AiDot Account Password",
+        "type": "string",
+        "required": true,
+        "description": "Your AiDot app password. Stored only in Homebridge config."
+      },
+      "countryCode": {
+        "title": "Country Code",
+        "type": "string",
+        "default": "US",
+        "description": "Your country code (US, EU, JP)"
+      },
+      "debug": {
+        "title": "Debug Mode",
+        "type": "boolean",
+        "default": false,
+        "description": "Enable verbose logging"
+      }
+    },
+    "required": ["name", "username", "password"]
+  },
+  "form": [
+    "name",
+    "username",
+    "password",
+    "countryCode",
+    "debug"
+  ]
+}
