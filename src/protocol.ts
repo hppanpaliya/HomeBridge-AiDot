@@ -67,6 +67,32 @@ function pkcs7Unpad(data: Uint8Array): Buffer {
   return Buffer.from(data.slice(0, data.length - padLen));
 }
 
+function normalizeAesKey(key: string): Buffer {
+  const normalized = key.trim();
+  if (!normalized) {
+    return Buffer.alloc(16);
+  }
+
+  // Some cloud responses surface the key as a 32-char hex string, while others
+  // return a raw UTF-8 token. Support both so we can talk to more devices.
+  if (/^[0-9a-fA-F]{32}$/.test(normalized)) {
+    return Buffer.from(normalized, 'hex');
+  }
+
+  const base64Candidate = Buffer.from(normalized, 'base64');
+  if (base64Candidate.length === 16) {
+    const normalizedBase64 = normalized.replace(/=+$/, '');
+    const reencoded = base64Candidate.toString('base64').replace(/=+$/, '');
+    if (reencoded === normalizedBase64) {
+      return base64Candidate;
+    }
+  }
+
+  const raw = Buffer.alloc(16);
+  Buffer.from(normalized, 'utf8').copy(raw, 0, 0, 16);
+  return raw;
+}
+
 // --- RGBW Encoding ---
 export function packRGBW(r: number, g: number, b: number, w: number): number {
   const val = (r << 24) | (g << 16) | (b << 8) | w;
@@ -209,9 +235,13 @@ export class AidotDeviceClient {
 
   constructor(device: AidotDevice) {
     this.device = device;
-    this.aesKey = Buffer.alloc(16);
-    if (device.aesKey) {
-      this.aesKey.write(device.aesKey, 'utf8');
+    this.aesKey = normalizeAesKey(device.aesKey);
+  }
+
+  updateDevice(device: Partial<AidotDevice>): void {
+    this.device = { ...this.device, ...device };
+    if (device.aesKey !== undefined) {
+      this.aesKey = normalizeAesKey(this.device.aesKey);
     }
   }
 
@@ -268,7 +298,7 @@ export class AidotDeviceClient {
   updateIp(ip: string): void {
     if (ip && ip !== this.device.ip) {
       this.device.ip = ip;
-      if (!this.connected && !this.closed) {
+      if (!this.connected && !this.closed && this.canConnect()) {
         this.doConnect().catch(() => {});
       }
     }
@@ -530,5 +560,9 @@ export class AidotDeviceClient {
     for (const cb of this.statusCallbacks) {
       cb(this.device.devId, { ...this.status });
     }
+  }
+
+  private canConnect(): boolean {
+    return Boolean(this.device.ip && this.device.aesKey && this.device.password && this.device.userId);
   }
 }

@@ -10,6 +10,17 @@ import { AiDotCloudClient } from './aidot-cloud';
 import { AidotDiscovery, AidotDevice, AidotDeviceClient } from './protocol';
 import { AidotLightAccessory } from './accessory';
 
+function normalizeCloudAesKey(aesKey?: string[]): string {
+  if (!aesKey || aesKey.length === 0) {
+    return '';
+  }
+
+  // AiDot has surfaced this as a single string in some payloads and as a
+  // segmented array in others. Joining preserves both forms reasonably well.
+  const joined = aesKey.join('');
+  return joined.trim() || aesKey.find((key) => key.trim().length > 0) || '';
+}
+
 const PLATFORM_NAME = 'AiDot';
 const PLUGIN_NAME = 'homebridge-aidot';
 
@@ -92,7 +103,7 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
         bindFlag: 1,
         version: 1,
         wifiMode: 0,
-        aesKey: cloudDevice.aesKey?.[0] || '',
+        aesKey: normalizeCloudAesKey(cloudDevice.aesKey),
         password: cloudDevice.password || this.config.password,
         name: cloudDevice.name || `AiDot Light ${cloudDevice.id.slice(0, 6)}`,
         userId: this.cloud.getUserId() || this.config.userId || this.config.username,
@@ -117,12 +128,6 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
   }
 
   private onDeviceFound(devId: string, ip: string, userId: string): void {
-    const client = this.deviceClients.get(devId);
-    if (client) {
-      client.updateIp(ip);
-      return;
-    }
-
     const accessory = this.findAccessory(devId);
     const device: AidotDevice = accessory?.context.device ?? {
       devId,
@@ -133,7 +138,7 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
       version: 1,
       wifiMode: 0,
       aesKey: '',
-      password: '',
+      password: this.config.password || '',
       name: `AiDot Light ${devId.slice(0, 6)}`,
       userId,
     };
@@ -181,10 +186,16 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
     if (!client) {
       client = new AidotDeviceClient(device);
       this.deviceClients.set(device.devId, client);
+    } else {
+      client.updateDevice(device);
     }
 
     if (!accessory.context.initialized) {
       new AidotLightAccessory(this.log, accessory, this.api, client);
+    }
+
+    if (!device.ip || !device.aesKey || !device.password) {
+      return;
     }
 
     client.connect(device.ip).then(() => {
