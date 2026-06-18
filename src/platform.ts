@@ -42,6 +42,7 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
   private readonly api: API;
   private discovery: AidotDiscovery | null = null;
   private deviceClients = new Map<string, AidotDeviceClient>();
+  private initializedAccessories = new Set<string>();
   private cloud: AiDotCloudClient | null = null;
 
   constructor(log: Logging, config: PlatformConfig, api: API) {
@@ -190,8 +191,9 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
       client.updateDevice(device);
     }
 
-    if (!accessory.context.initialized) {
+    if (!this.initializedAccessories.has(accessory.UUID)) {
       new AidotLightAccessory(this.log, accessory, this.api, client);
+      this.initializedAccessories.add(accessory.UUID);
     }
 
     if (!device.ip || !device.aesKey || !device.password) {

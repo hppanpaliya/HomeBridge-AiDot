@@ -81,8 +81,6 @@ export class AidotLightAccessory implements AccessoryPlugin {
         this.onDeviceStatus(status);
       }
     }, 3000);
-
-    accessory.context.initialized = true;
   }
 
   // --- Getters ---

@@ -226,12 +226,14 @@ export class AidotDeviceClient {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingCount = 0;
   private connected = false;
+  private connecting = false;
   private closed = false;
   private buffer = Buffer.alloc(0);
   private aesKey: Buffer;
   private statusCallbacks: StatusCallback[] = [];
   private loginResolve: (() => void) | null = null;
   private loginReject: ((err: Error) => void) | null = null;
+  private connectPromise: Promise<void> | null = null;
 
   constructor(device: AidotDevice) {
     this.device = device;
@@ -261,33 +263,67 @@ export class AidotDeviceClient {
     return this.connected;
   }
 
+  isConnecting(): boolean {
+    return this.connecting;
+  }
+
   async connect(ip: string): Promise<void> {
-    if (this.connected || this.closed) return;
+    if (this.closed) return;
     this.device.ip = ip;
-    return this.doConnect();
+    if (this.connected) return;
+    if (this.connecting && this.connectPromise) {
+      return this.connectPromise;
+    }
+
+    this.connecting = true;
+    this.connectPromise = this.doConnect().finally(() => {
+      this.connecting = false;
+      this.connectPromise = null;
+    });
+    return this.connectPromise;
   }
 
   private doConnect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (this.socket) {
-        try { this.socket.destroy(); } catch {}
-      }
-      this.socket = new net.Socket();
-      this.socket.setNoDelay(true);
-      this.socket.connect(DEVICE_PORT, this.device.ip, () => {
+      const socket = new net.Socket();
+      this.socket = socket;
+      socket.setNoDelay(true);
+      socket.connect(DEVICE_PORT, this.device.ip, () => {
+        if (this.socket !== socket || this.closed) {
+          try { socket.destroy(); } catch {}
+          return;
+        }
         this.loginResolve = resolve;
         this.loginReject = reject;
         this.login();
       });
-      this.socket.on('data', (data) => this.onData(data));
-      this.socket.on('error', (err) => {
+      socket.on('data', (data) => {
+        if (this.socket !== socket) return;
+        this.onData(data);
+      });
+      socket.on('error', (err) => {
+        if (this.socket !== socket) return;
         console.error(`[AiDot ${this.device.devId.slice(0, 8)}] TCP error:`, err.message);
+        if (!this.connected && this.loginReject) {
+          this.loginReject(err);
+          this.loginResolve = null;
+          this.loginReject = null;
+        }
         this.reset();
       });
-      this.socket.on('close', () => {
+      socket.on('close', () => {
+        if (this.socket !== socket) return;
+        this.socket = null;
+        const wasConnected = this.connected;
         this.connected = false;
+        this.connecting = false;
         this.status.online = false;
         this.notifyStatus();
+        if (!wasConnected && this.loginReject) {
+          this.loginReject(new Error('Connection closed before login completed'));
+          this.loginResolve = null;
+          this.loginReject = null;
+        }
         if (!this.closed) {
           this.scheduleReconnect();
         }
@@ -298,7 +334,7 @@ export class AidotDeviceClient {
   updateIp(ip: string): void {
     if (ip && ip !== this.device.ip) {
       this.device.ip = ip;
-      if (!this.connected && !this.closed && this.canConnect()) {
+      if (!this.connected && !this.connecting && !this.closed && this.canConnect()) {
         this.doConnect().catch(() => {});
       }
     }
@@ -376,6 +412,9 @@ export class AidotDeviceClient {
   }
 
   private async sendAction(attr: Record<string, unknown> | string[], method: string = 'setDevAttrReq'): Promise<void> {
+    if (this.connectPromise) {
+      await this.connectPromise.catch(() => {});
+    }
     if (!this.connected || !this.socket) {
       throw new Error('Not connected');
     }
@@ -535,12 +574,14 @@ export class AidotDeviceClient {
 
   private reset(): void {
     this.connected = false;
+    this.connecting = false;
     this.status.online = false;
     this.notifyStatus();
     if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
     if (this.socket) {
-      try { this.socket.destroy(); } catch {}
+      const socket = this.socket;
       this.socket = null;
+      try { socket.destroy(); } catch {}
     }
     if (!this.closed) {
       this.scheduleReconnect();
@@ -551,7 +592,7 @@ export class AidotDeviceClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => {
       if (!this.closed && this.device.ip) {
-        this.doConnect().catch(() => {});
+        this.connect(this.device.ip).catch(() => {});
       }
     }, RECONNECT_DELAY);
   }
