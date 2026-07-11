@@ -1,7 +1,6 @@
 import * as dgram from 'dgram';
 import * as net from 'net';
 import * as crypto from 'crypto';
-import AES from 'aes-js';
 
 // --- Constants ---
 const DISCOVERY_PORT = 6666;
@@ -10,7 +9,10 @@ const DEVICE_PORT = 10000;
 const MAGIC = 0x1eed;
 const HEARTBEAT_INTERVAL = 30_000;
 const MAX_MISSED_PINGS = 3;
-const RECONNECT_DELAY = 60_000;
+const CONNECT_TIMEOUT = 10_000;
+const RECONNECT_BASE_DELAY = 2_000;
+const RECONNECT_MAX_DELAY = 60_000;
+const STATUS_SYNC_INTERVAL = 300_000;
 
 const DISCOVERY_KEY = Buffer.from('T54uednca587'.padEnd(32, '\0'), 'utf8');
 const DISCOVER_FAST = 6;
@@ -29,6 +31,7 @@ export interface AidotDevice {
   password: string;
   name: string;
   userId: string;
+  firmwareVersion?: string;
 }
 
 export interface DeviceStatus {
@@ -41,20 +44,27 @@ export interface DeviceStatus {
 
 export type StatusCallback = (deviceId: string, status: DeviceStatus) => void;
 
-// --- AES Helpers ---
+// --- AES Helpers (AES-ECB with PKCS7, via Node's built-in crypto) ---
+// The discovery key is 32 bytes (AES-256), per-device keys are 16 (AES-128).
+function ecbAlgorithm(key: Buffer): string {
+  return key.length === 32 ? 'aes-256-ecb' : 'aes-128-ecb';
+}
+
 function aesEcbEncrypt(data: Buffer, key: Buffer): Buffer {
+  const cipher = crypto.createCipheriv(ecbAlgorithm(key), key, null);
+  cipher.setAutoPadding(false);
   const padded = pkcs7Pad(data, 16);
-  const aesCbc = new AES.ModeOfOperation.ecb(key);
-  return Buffer.from(aesCbc.encrypt(padded));
+  return Buffer.concat([cipher.update(padded), cipher.final()]);
 }
 
 function aesEcbDecrypt(data: Buffer, key: Buffer): Buffer {
-  const aesCbc = new AES.ModeOfOperation.ecb(key);
-  const decrypted = aesCbc.decrypt(data);
+  const decipher = crypto.createDecipheriv(ecbAlgorithm(key), key, null);
+  decipher.setAutoPadding(false);
+  const decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
   return pkcs7Unpad(decrypted);
 }
 
-function pkcs7Pad(data: Buffer, blockSize: number): Uint8Array {
+function pkcs7Pad(data: Buffer, blockSize: number): Buffer {
   const padLen = blockSize - (data.length % blockSize);
   const padded = Buffer.alloc(data.length + padLen);
   data.copy(padded);
@@ -62,9 +72,14 @@ function pkcs7Pad(data: Buffer, blockSize: number): Uint8Array {
   return padded;
 }
 
-function pkcs7Unpad(data: Uint8Array): Buffer {
+function pkcs7Unpad(data: Buffer): Buffer {
   const padLen = data[data.length - 1];
-  return Buffer.from(data.slice(0, data.length - padLen));
+  if (padLen < 1 || padLen > 16 || padLen > data.length) {
+    // Invalid padding usually means the AES key is wrong — return as-is so
+    // the JSON parse fails loudly instead of silently truncating.
+    return data;
+  }
+  return data.slice(0, data.length - padLen);
 }
 
 function normalizeAesKey(key: string): Buffer {
@@ -124,17 +139,23 @@ export class AidotDiscovery {
   private userId: string;
   private discovered: Map<string, string> = new Map(); // devId -> ip
   private onDevice: (devId: string, ip: string) => void;
+  private logError: (msg: string) => void;
 
-  constructor(userId: string, onDevice: (devId: string, ip: string) => void) {
+  constructor(
+    userId: string,
+    onDevice: (devId: string, ip: string) => void,
+    logError: (msg: string) => void = (msg) => console.error(msg),
+  ) {
     this.userId = userId;
     this.onDevice = onDevice;
+    this.logError = logError;
   }
 
   start(): void {
     this.socket = dgram.createSocket('udp4');
     this.socket.on('message', (msg, rinfo) => this.onMessage(msg, rinfo));
     this.socket.on('error', (err) => {
-      console.error('[AiDot Discovery] Socket error:', err.message);
+      this.logError(`AiDot discovery socket error: ${err.message}`);
     });
     this.socket.bind(0, () => {
       const sock = this.socket!;
@@ -198,8 +219,12 @@ export class AidotDiscovery {
       if (json.method === 'devDiscoveryResp' && json.payload?.devId) {
         const devId = json.payload.devId;
         const ip = json.payload.ip || rinfo.address;
-        this.discovered.set(devId, ip);
-        this.onDevice(devId, ip);
+        // Only notify on first sight or IP change — repeat broadcasts for a
+        // known device would otherwise churn accessory updates every cycle.
+        if (this.discovered.get(devId) !== ip) {
+          this.discovered.set(devId, ip);
+          this.onDevice(devId, ip);
+        }
       }
     } catch {
       // Ignore malformed responses from other devices
@@ -224,6 +249,9 @@ export class AidotDeviceClient {
   private ascNumber = 1;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private connectTimeoutTimer: NodeJS.Timeout | null = null;
+  private statusSyncTimer: NodeJS.Timeout | null = null;
+  private reconnectAttempts = 0;
   private pingCount = 0;
   private connected = false;
   private connecting = false;
@@ -288,6 +316,18 @@ export class AidotDeviceClient {
       const socket = new net.Socket();
       this.socket = socket;
       socket.setNoDelay(true);
+
+      // Cover both the TCP connect and the login handshake — without this a
+      // device that accepts TCP but never answers loginReq would leave every
+      // HomeKit command awaiting a promise that never settles.
+      this.connectTimeoutTimer = setTimeout(() => {
+        if (this.socket !== socket || this.connected) return;
+        reject(new Error(`Connection to ${this.device.ip} timed out`));
+        this.loginResolve = null;
+        this.loginReject = null;
+        this.reset();
+      }, CONNECT_TIMEOUT);
+
       socket.connect(DEVICE_PORT, this.device.ip, () => {
         if (this.socket !== socket || this.closed) {
           try { socket.destroy(); } catch {}
@@ -304,8 +344,8 @@ export class AidotDeviceClient {
       socket.on('error', (err) => {
         if (this.socket !== socket) return;
         console.error(`[AiDot ${this.device.devId.slice(0, 8)}] TCP error:`, err.message);
-        if (!this.connected && this.loginReject) {
-          this.loginReject(err);
+        if (!this.connected) {
+          reject(err);
           this.loginResolve = null;
           this.loginReject = null;
         }
@@ -318,9 +358,12 @@ export class AidotDeviceClient {
         this.connected = false;
         this.connecting = false;
         this.status.online = false;
+        this.clearConnectTimeout();
+        if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
+        if (this.statusSyncTimer) clearInterval(this.statusSyncTimer);
         this.notifyStatus();
-        if (!wasConnected && this.loginReject) {
-          this.loginReject(new Error('Connection closed before login completed'));
+        if (!wasConnected) {
+          reject(new Error('Connection closed before login completed'));
           this.loginResolve = null;
           this.loginReject = null;
         }
@@ -334,8 +377,8 @@ export class AidotDeviceClient {
   updateIp(ip: string): void {
     if (ip && ip !== this.device.ip) {
       this.device.ip = ip;
-      if (!this.connected && !this.connecting && !this.closed && this.canConnect()) {
-        this.doConnect().catch(() => {});
+      if (!this.connected && !this.closed && this.canConnect()) {
+        this.connect(ip).catch(() => {});
       }
     }
   }
@@ -382,12 +425,21 @@ export class AidotDeviceClient {
     this.closed = true;
     if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.statusSyncTimer) clearInterval(this.statusSyncTimer);
+    this.clearConnectTimeout();
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
     }
     this.connected = false;
     this.status.online = false;
+  }
+
+  private clearConnectTimeout(): void {
+    if (this.connectTimeoutTimer) {
+      clearTimeout(this.connectTimeoutTimer);
+      this.connectTimeoutTimer = null;
+    }
   }
 
   // --- Protocol ---
@@ -496,6 +548,8 @@ export class AidotDeviceClient {
           this.connected = true;
           this.status.online = true;
           this.pingCount = 0;
+          this.reconnectAttempts = 0;
+          this.clearConnectTimeout();
           this.notifyStatus();
           if (this.loginResolve) {
             this.loginResolve();
@@ -503,6 +557,7 @@ export class AidotDeviceClient {
             this.loginReject = null;
           }
           this.startHeartbeat();
+          this.startStatusSync();
           this.sendGetAttrs();
         } else {
           if (this.loginReject) {
@@ -517,7 +572,7 @@ export class AidotDeviceClient {
       // Device attribute response
       if (json.payload?.attr) {
         this.pingCount = 0;
-        if (json.payload.ascNumber) {
+        if (typeof json.payload.ascNumber === 'number') {
           this.ascNumber = json.payload.ascNumber + 1;
         }
         this.updateStatus(json.payload.attr);
@@ -555,6 +610,17 @@ export class AidotDeviceClient {
     this.heartbeatTimer = setTimeout(() => this.sendPing(), HEARTBEAT_INTERVAL);
   }
 
+  // Periodically re-read device attributes so HomeKit converges even if the
+  // device changed state via the AiDot app and never pushed an update.
+  private startStatusSync(): void {
+    if (this.statusSyncTimer) clearInterval(this.statusSyncTimer);
+    this.statusSyncTimer = setInterval(() => {
+      if (this.connected && !this.closed) {
+        this.sendGetAttrs();
+      }
+    }, STATUS_SYNC_INTERVAL);
+  }
+
   private sendPing(): void {
     if (!this.connected || this.closed) return;
     this.pingCount++;
@@ -578,6 +644,8 @@ export class AidotDeviceClient {
     this.status.online = false;
     this.notifyStatus();
     if (this.heartbeatTimer) clearTimeout(this.heartbeatTimer);
+    if (this.statusSyncTimer) clearInterval(this.statusSyncTimer);
+    this.clearConnectTimeout();
     if (this.socket) {
       const socket = this.socket;
       this.socket = null;
@@ -588,13 +656,20 @@ export class AidotDeviceClient {
     }
   }
 
+  // Exponential backoff: 2s, 4s, 8s, ... capped at 60s. A brief WiFi blip
+  // recovers in seconds instead of leaving the light dead for a minute.
   private scheduleReconnect(): void {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    const delay = Math.min(
+      RECONNECT_BASE_DELAY * 2 ** this.reconnectAttempts,
+      RECONNECT_MAX_DELAY,
+    );
+    this.reconnectAttempts++;
     this.reconnectTimer = setTimeout(() => {
-      if (!this.closed && this.device.ip) {
+      if (!this.closed && !this.connected && this.device.ip) {
         this.connect(this.device.ip).catch(() => {});
       }
-    }, RECONNECT_DELAY);
+    }, delay);
   }
 
   private notifyStatus(): void {

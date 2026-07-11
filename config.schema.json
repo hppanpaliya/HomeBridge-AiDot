@@ -29,6 +29,17 @@
         "default": "US",
         "description": "Your country code (US, EU, JP)"
       },
+      "userId": {
+        "title": "AiDot User ID (optional)",
+        "type": "string",
+        "description": "Override the user ID used for LAN control. Normally discovered automatically from the cloud login."
+      },
+      "removeStaleDevices": {
+        "title": "Remove Stale Devices",
+        "type": "boolean",
+        "default": false,
+        "description": "Automatically remove accessories for devices that are no longer in your AiDot account."
+      },
       "debug": {
         "title": "Debug Mode",
         "type": "boolean",
@@ -43,6 +54,8 @@
     "username",
     "password",
     "countryCode",
+    "userId",
+    "removeStaleDevices",
     "debug"
   ]
 }

@@ -1,14 +1,19 @@
 import {
-  AccessoryPlugin,
   API,
   CharacteristicValue,
   PlatformAccessory,
   Logging,
   Service,
 } from 'homebridge';
-import { AidotDeviceClient, DeviceStatus, unpackRGBW } from './protocol';
+import { AidotDevice, AidotDeviceClient, DeviceStatus } from './protocol';
 
-export class AidotLightAccessory implements AccessoryPlugin {
+// Device supports 2700K-6500K. In HomeKit mireds that is 154 (6500K) to
+// 370 (2700K). Advertising a wider range makes the Home app slider snap
+// back after every adjustment outside what the bulb can do.
+const MIN_MIRED = 154;
+const MAX_MIRED = 370;
+
+export class AidotLightAccessory {
   private readonly log: Logging;
   private readonly api: API;
   private readonly client: AidotDeviceClient;
@@ -22,10 +27,15 @@ export class AidotLightAccessory implements AccessoryPlugin {
   private brightness = 100;
   private hue = 0;
   private saturation = 0;
-  private colorTemperature = 153; // mired (6500K)
+  private colorTemperature = MIN_MIRED;
 
   // Track last mode: 'color' or 'temperature'
   private colorMode: 'color' | 'temperature' = 'temperature';
+
+  // HomeKit sends Hue and Saturation as separate writes; coalesce them into
+  // a single RGBW command instead of hitting the device twice.
+  private colorSendTimer: NodeJS.Timeout | null = null;
+  private colorSendWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
 
   constructor(log: Logging, accessory: PlatformAccessory, api: API, client: AidotDeviceClient) {
     this.log = log;
@@ -33,13 +43,16 @@ export class AidotLightAccessory implements AccessoryPlugin {
     this.api = api;
     this.client = client;
 
+    const device = accessory.context.device as AidotDevice | undefined;
+
     // Accessory Information
     this.informationService = accessory.getService(api.hap.Service.AccessoryInformation) ??
-      accessory.addService(api.hap.Service.AccessoryInformation)
+      accessory.addService(api.hap.Service.AccessoryInformation);
+    this.informationService
       .setCharacteristic(api.hap.Characteristic.Manufacturer, 'AiDot')
-      .setCharacteristic(api.hap.Characteristic.Model, 'WiFi Light')
+      .setCharacteristic(api.hap.Characteristic.Model, device?.productModel || 'WiFi Light')
       .setCharacteristic(api.hap.Characteristic.SerialNumber, client.getDeviceId().slice(0, 16))
-      .setCharacteristic(api.hap.Characteristic.FirmwareRevision, '1.0.0');
+      .setCharacteristic(api.hap.Characteristic.FirmwareRevision, device?.firmwareVersion || '1.0.0');
 
     // Lightbulb Service
     this.lightService = accessory.getService(api.hap.Service.Lightbulb) ??
@@ -65,93 +78,154 @@ export class AidotLightAccessory implements AccessoryPlugin {
       .onGet(() => this.getSaturation())
       .onSet((v) => this.setSaturation(v));
 
-    // Color Temperature (mired: 153 = 6500K, 500 = 2000K)
+    // Color Temperature
     this.lightService.getCharacteristic(api.hap.Characteristic.ColorTemperature)
-      .setProps({ minValue: 153, maxValue: 500, minStep: 1 })
+      .setProps({ minValue: MIN_MIRED, maxValue: MAX_MIRED, minStep: 1 })
       .onGet(() => this.getColorTemperature())
       .onSet((v) => this.setColorTemperature(v));
+
+    // Adaptive Lighting: lets the Home app shift white temperature through
+    // the day. AUTOMATIC mode is fully managed by HAP-NodeJS — it drives our
+    // ColorTemperature setter and disables itself when the user picks a color.
+    try {
+      const controller = new api.hap.AdaptiveLightingController(this.lightService, {
+        controllerMode: api.hap.AdaptiveLightingControllerMode.AUTOMATIC,
+      });
+      accessory.configureController(controller);
+    } catch (e) {
+      this.log.debug(`[${accessory.displayName}] Adaptive Lighting unavailable: ${(e as Error).message}`);
+    }
 
     // Listen for device status updates
     client.onStatusUpdate((_devId, status) => this.onDeviceStatus(status));
 
-    // Load initial state from device
-    setTimeout(() => {
-      const status = client.getStatus();
-      if (status.online) {
-        this.onDeviceStatus(status);
-      }
-    }, 3000);
+    const status = client.getStatus();
+    if (status.online) {
+      this.onDeviceStatus(status);
+    }
+  }
+
+  // Surface offline devices as "No Response" in the Home app instead of
+  // silently returning stale cached state.
+  private assertOnline(): void {
+    if (!this.client.isOnline()) {
+      throw new this.api.hap.HapStatusError(
+        this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
+      );
+    }
+  }
+
+  private commError(): Error {
+    return new this.api.hap.HapStatusError(
+      this.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
+    );
   }
 
   // --- Getters ---
   getOn(): CharacteristicValue {
+    this.assertOnline();
     return this.isOn;
   }
 
   getBrightness(): CharacteristicValue {
+    this.assertOnline();
     return this.brightness;
   }
 
   getHue(): CharacteristicValue {
+    this.assertOnline();
     return this.hue;
   }
 
   getSaturation(): CharacteristicValue {
+    this.assertOnline();
     return this.saturation;
   }
 
   getColorTemperature(): CharacteristicValue {
+    this.assertOnline();
     return this.colorTemperature;
   }
 
   // --- Setters ---
-  setOn(value: CharacteristicValue): void {
-    this.isOn = value as boolean;
-    const cmd = this.isOn ? 'ON' : 'OFF';
-    this.log.info(`[${this.accessory.displayName}] Setting ${cmd}`);
-    if (this.isOn) {
-      this.client.turnOn().catch((e) => this.log.error(`Turn on failed: ${e.message}`));
-    } else {
-      this.client.turnOff().catch((e) => this.log.error(`Turn off failed: ${e.message}`));
+  async setOn(value: CharacteristicValue): Promise<void> {
+    const on = value as boolean;
+    this.log.info(`[${this.accessory.displayName}] Setting ${on ? 'ON' : 'OFF'}`);
+    try {
+      if (on) {
+        await this.client.turnOn();
+      } else {
+        await this.client.turnOff();
+      }
+      this.isOn = on;
+    } catch (e) {
+      this.log.error(`[${this.accessory.displayName}] Turn ${on ? 'on' : 'off'} failed: ${(e as Error).message}`);
+      throw this.commError();
     }
   }
 
-  setBrightness(value: CharacteristicValue): void {
-    this.brightness = value as number;
-    this.log.info(`[${this.accessory.displayName}] Brightness: ${this.brightness}%`);
-    this.client.setBrightness(this.brightness).catch((e) => this.log.error(`Brightness failed: ${e.message}`));
+  async setBrightness(value: CharacteristicValue): Promise<void> {
+    const brightness = value as number;
+    this.log.info(`[${this.accessory.displayName}] Brightness: ${brightness}%`);
+    try {
+      await this.client.setBrightness(brightness);
+      this.brightness = brightness;
+    } catch (e) {
+      this.log.error(`[${this.accessory.displayName}] Brightness failed: ${(e as Error).message}`);
+      throw this.commError();
+    }
   }
 
-  setHue(value: CharacteristicValue): void {
+  async setHue(value: CharacteristicValue): Promise<void> {
     this.hue = value as number;
     this.colorMode = 'color';
-    this.log.info(`[${this.accessory.displayName}] Hue: ${this.hue}`);
-    this.sendColor();
+    return this.queueColorSend();
   }
 
-  setSaturation(value: CharacteristicValue): void {
+  async setSaturation(value: CharacteristicValue): Promise<void> {
     this.saturation = value as number;
     this.colorMode = 'color';
-    this.log.info(`[${this.accessory.displayName}] Saturation: ${this.saturation}`);
-    this.sendColor();
+    return this.queueColorSend();
   }
 
-  setColorTemperature(value: CharacteristicValue): void {
-    this.colorTemperature = value as number;
+  async setColorTemperature(value: CharacteristicValue): Promise<void> {
+    const mired = value as number;
     this.colorMode = 'temperature';
     // Convert mired to Kelvin: K = 1_000_000 / mired
-    const kelvin = Math.round(1_000_000 / this.colorTemperature);
+    const kelvin = Math.round(1_000_000 / mired);
     const clamped = Math.max(2700, Math.min(6500, kelvin));
-    this.log.info(`[${this.accessory.displayName}] Color Temp: ${this.colorTemperature} mired (${clamped}K)`);
-    this.client.setCCT(clamped).catch((e) => this.log.error(`CCT failed: ${e.message}`));
+    this.log.info(`[${this.accessory.displayName}] Color Temp: ${mired} mired (${clamped}K)`);
+    try {
+      await this.client.setCCT(clamped);
+      this.colorTemperature = mired;
+    } catch (e) {
+      this.log.error(`[${this.accessory.displayName}] CCT failed: ${(e as Error).message}`);
+      throw this.commError();
+    }
   }
 
   // --- Internal ---
-  private sendColor(): void {
-    // Convert HSV to RGBW
-    const rgb = hsvToRgb(this.hue, this.saturation, this.brightness);
-    this.log.info(`[${this.accessory.displayName}] RGBW: (${rgb.r}, ${rgb.g}, ${rgb.b}, 0)`);
-    this.client.setRGBW(rgb.r, rgb.g, rgb.b, 0).catch((e) => this.log.error(`RGBW failed: ${e.message}`));
+  private queueColorSend(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.colorSendWaiters.push({ resolve, reject });
+      if (this.colorSendTimer) {
+        clearTimeout(this.colorSendTimer);
+      }
+      this.colorSendTimer = setTimeout(() => {
+        this.colorSendTimer = null;
+        const waiters = this.colorSendWaiters;
+        this.colorSendWaiters = [];
+        const rgb = hsvToRgb(this.hue, this.saturation, this.brightness);
+        this.log.info(`[${this.accessory.displayName}] Color: hue=${this.hue} sat=${this.saturation} -> RGBW(${rgb.r}, ${rgb.g}, ${rgb.b}, 0)`);
+        this.client.setRGBW(rgb.r, rgb.g, rgb.b, 0).then(
+          () => waiters.forEach((w) => w.resolve()),
+          (e) => {
+            this.log.error(`[${this.accessory.displayName}] RGBW failed: ${(e as Error).message}`);
+            waiters.forEach((w) => w.reject(this.commError()));
+          },
+        );
+      }, 50);
+    });
   }
 
   private onDeviceStatus(status: DeviceStatus): void {
@@ -183,14 +257,12 @@ export class AidotLightAccessory implements AccessoryPlugin {
     // Update from device CCT
     if (status.cct > 0) {
       const mired = Math.round(1_000_000 / status.cct);
-      const clamped = Math.max(153, Math.min(500, mired));
-      this.colorTemperature = clamped;
-      this.lightService.updateCharacteristic(this.api.hap.Characteristic.ColorTemperature, this.colorTemperature);
+      const clamped = Math.max(MIN_MIRED, Math.min(MAX_MIRED, mired));
+      if (this.colorTemperature !== clamped) {
+        this.colorTemperature = clamped;
+        this.lightService.updateCharacteristic(this.api.hap.Characteristic.ColorTemperature, this.colorTemperature);
+      }
     }
-  }
-
-  getServices(): Service[] {
-    return [this.informationService, this.lightService];
   }
 }
 

@@ -5,10 +5,12 @@ import {
   PlatformAccessory,
   PlatformConfig,
 } from 'homebridge';
-import { loadDotEnv } from './env';
 import { AiDotCloudClient } from './aidot-cloud';
 import { AidotDiscovery, AidotDevice, AidotDeviceClient } from './protocol';
 import { AidotLightAccessory } from './accessory';
+
+const CLOUD_SYNC_RETRY_DELAY = 60_000;
+const CLOUD_SYNC_MAX_RETRIES = 5;
 
 function normalizeCloudAesKey(aesKey?: string[]): string {
   if (!aesKey || aesKey.length === 0) {
@@ -29,6 +31,7 @@ interface AiDotPlatformConfig extends PlatformConfig {
   password: string;
   countryCode?: string;
   userId?: string;
+  removeStaleDevices?: boolean;
   debug?: boolean;
 }
 
@@ -44,9 +47,9 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
   private deviceClients = new Map<string, AidotDeviceClient>();
   private initializedAccessories = new Set<string>();
   private cloud: AiDotCloudClient | null = null;
+  private cloudRetryTimer: NodeJS.Timeout | null = null;
 
   constructor(log: Logging, config: PlatformConfig, api: API) {
-    loadDotEnv();
     this.log = log;
     this.config = config as AiDotPlatformConfig;
     this.api = api;
@@ -54,7 +57,12 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
     this.Characteristic = api.hap.Characteristic;
 
     this.api.on('didFinishLaunching', () => {
+      this.connectCachedAccessories();
       this.startDiscovery();
+    });
+
+    this.api.on('shutdown', () => {
+      this.shutdown();
     });
   }
 
@@ -64,16 +72,59 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
     this.configureAccessoryServices(accessory);
   }
 
+  // Cached accessories carry the device's last known IP and AES key, so we
+  // can reconnect immediately at startup instead of waiting for cloud login
+  // or a LAN discovery response.
+  private connectCachedAccessories(): void {
+    for (const accessory of this.accessories) {
+      const device = accessory.context.device as AidotDevice | undefined;
+      if (device?.devId) {
+        this.ensureClient(device, accessory);
+      }
+    }
+  }
+
   private startDiscovery(): void {
     const userId = this.config.userId || this.config.username || '0';
-    this.discovery = new AidotDiscovery(userId, (devId, ip) => {
-      this.onDeviceFound(devId, ip, userId);
-    });
+    this.discovery = new AidotDiscovery(
+      userId,
+      (devId, ip) => {
+        this.onDeviceFound(devId, ip, userId);
+      },
+      (msg) => this.log.warn(msg),
+    );
     this.discovery.start();
     this.log.info('AiDot LAN discovery started');
 
+    this.syncCloudDevicesWithRetry(0);
+  }
+
+  private shutdown(): void {
+    if (this.cloudRetryTimer) {
+      clearTimeout(this.cloudRetryTimer);
+      this.cloudRetryTimer = null;
+    }
+    this.discovery?.stop();
+    this.discovery = null;
+    for (const client of this.deviceClients.values()) {
+      client.close().catch(() => {});
+    }
+  }
+
+  private syncCloudDevicesWithRetry(attempt: number): void {
     this.syncCloudDevices().catch((err) => {
-      this.log.warn(`AiDot cloud sync failed: ${err.message}`);
+      if (attempt < CLOUD_SYNC_MAX_RETRIES) {
+        this.log.warn(
+          `AiDot cloud sync failed (attempt ${attempt + 1}/${CLOUD_SYNC_MAX_RETRIES + 1}), ` +
+          `retrying in ${CLOUD_SYNC_RETRY_DELAY / 1000}s: ${err.message}`,
+        );
+        this.cloudRetryTimer = setTimeout(
+          () => this.syncCloudDevicesWithRetry(attempt + 1),
+          CLOUD_SYNC_RETRY_DELAY,
+        );
+      } else {
+        this.log.error(`AiDot cloud sync failed permanently: ${err.message}`);
+      }
     });
   }
 
@@ -108,6 +159,7 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
         password: cloudDevice.password || this.config.password,
         name: cloudDevice.name || `AiDot Light ${cloudDevice.id.slice(0, 6)}`,
         userId: this.cloud.getUserId() || this.config.userId || this.config.username,
+        firmwareVersion: cloudDevice.firmwareVersion,
       };
 
       if (accessory) {
@@ -116,14 +168,38 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
         accessory.updateDisplayName(device.name);
         this.api.updatePlatformAccessories([accessory]);
         this.configureAccessoryServices(accessory);
-        if (device.ip) {
-          this.ensureClient(device, accessory);
-        }
+        this.ensureClient(device, accessory);
       } else {
-        const created = this.addAccessory(device);
-        if (device.ip) {
-          this.ensureClient(device, created);
-        }
+        this.addAccessory(device);
+      }
+    }
+
+    if (this.config.removeStaleDevices) {
+      this.removeStaleAccessories(cloudDevices.map((d) => d.id));
+    }
+  }
+
+  // Remove cached accessories for devices no longer in the AiDot account.
+  // Only called after a successful full cloud sync, so a transient cloud
+  // outage can never wipe accessories.
+  private removeStaleAccessories(cloudDeviceIds: string[]): void {
+    const validUuids = new Set(
+      cloudDeviceIds.filter(Boolean).map((id) => this.api.hap.uuid.generate(id)),
+    );
+    const stale = this.accessories.filter((a) => !validUuids.has(a.UUID));
+    for (const accessory of stale) {
+      this.log.info(`Removing stale accessory no longer in AiDot account: ${accessory.displayName}`);
+      const devId = (accessory.context.device as AidotDevice | undefined)?.devId;
+      if (devId) {
+        const client = this.deviceClients.get(devId);
+        client?.close().catch(() => {});
+        this.deviceClients.delete(devId);
+      }
+      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.initializedAccessories.delete(accessory.UUID);
+      const idx = this.accessories.indexOf(accessory);
+      if (idx >= 0) {
+        this.accessories.splice(idx, 1);
       }
     }
   }
@@ -213,10 +289,13 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    accessory.getService(this.Service.AccessoryInformation)!
+    const info = accessory.getService(this.Service.AccessoryInformation)!
       .setCharacteristic(this.Characteristic.Manufacturer, 'AiDot')
       .setCharacteristic(this.Characteristic.Model, device.productModel || 'WiFi Light')
       .setCharacteristic(this.Characteristic.SerialNumber, device.devId.slice(0, 16));
+    if (device.firmwareVersion) {
+      info.setCharacteristic(this.Characteristic.FirmwareRevision, device.firmwareVersion);
+    }
 
     let service = accessory.getService(this.Service.Lightbulb);
     if (!service) {
@@ -228,6 +307,6 @@ export class AiDotPlatform implements DynamicPlatformPlugin {
     service.getCharacteristic(this.Characteristic.Hue);
     service.getCharacteristic(this.Characteristic.Saturation);
     service.getCharacteristic(this.Characteristic.ColorTemperature)
-      .setProps({ minValue: 153, maxValue: 500, minStep: 1 });
+      .setProps({ minValue: 154, maxValue: 370, minStep: 1 });
   }
 }

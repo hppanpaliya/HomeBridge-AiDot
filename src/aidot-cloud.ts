@@ -57,6 +57,14 @@ function rsaPasswordEncrypt(message: string): string {
   return encrypted.toString('base64');
 }
 
+const REQUEST_TIMEOUT = 15_000;
+
+const COUNTRY_NAMES: Record<string, string> = {
+  us: 'United States',
+  eu: 'Germany',
+  jp: 'Japan',
+};
+
 export class AiDotCloudClient {
   private readonly region: string;
   private readonly baseUrl: string;
@@ -65,13 +73,14 @@ export class AiDotCloudClient {
   private accessToken = '';
   private refreshToken = '';
   private userId = '';
-  private countryName = 'United States';
+  private countryName: string;
   private token: LoginResponse | null = null;
 
   constructor(username: string, password: string, countryCode = 'US') {
     this.username = username;
     this.password = password;
     this.region = countryCode.toLowerCase() === 'eu' ? 'eu' : countryCode.toLowerCase() === 'jp' ? 'jp' : DEFAULT_REGION;
+    this.countryName = COUNTRY_NAMES[this.region] || COUNTRY_NAMES.us;
     this.baseUrl = API_URL_TEMPLATE.replace('{region}', this.region);
   }
 
@@ -82,6 +91,7 @@ export class AiDotCloudClient {
   async login(): Promise<void> {
     const response = await fetch(`${this.baseUrl}/users/loginWithFreeVerification`, {
       method: 'POST',
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT),
       headers: {
         Appid: APP_ID,
         Terminal: 'app',
@@ -98,7 +108,7 @@ export class AiDotCloudClient {
       }),
     });
 
-    const data = (await response.json()) as LoginResponse;
+    const data = (await response.json().catch(() => null)) as LoginResponse | null;
     if (!response.ok || !data?.accessToken) {
       throw new Error(`AiDot login failed: ${JSON.stringify(data)}`);
     }
@@ -143,6 +153,7 @@ export class AiDotCloudClient {
       throw new Error('AiDot cloud client is not logged in');
     }
     const response = await fetch(`${this.baseUrl}${path}`, {
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT),
       headers: {
         Appid: APP_ID,
         Terminal: 'app',
@@ -150,7 +161,7 @@ export class AiDotCloudClient {
       },
     });
 
-    const data = await response.json();
+    const data = await response.json().catch(() => null);
     if (!response.ok) {
       throw new Error(`AiDot request failed ${response.status}: ${JSON.stringify(data)}`);
     }
